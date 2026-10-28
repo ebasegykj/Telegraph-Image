@@ -39,7 +39,10 @@ export async function getMetadata(env, id) {
   return record?.metadata || null;
 }
 
-export async function getOrCreateMetadata(env, id) {
+// onCreated is invoked when a record did not exist and was just written.
+// Callers use it to know whether a later putMetadata is actually needed,
+// so ordinary views do not burn the KV free-tier write quota.
+export async function getOrCreateMetadata(env, id, onCreated) {
   const record = await env.img_url.getWithMetadata(id);
 
   if (record?.metadata) {
@@ -48,6 +51,9 @@ export async function getOrCreateMetadata(env, id) {
 
   const metadata = createDefaultMetadata(id);
   await putMetadata(env, id, metadata);
+  if (typeof onCreated === 'function') {
+    onCreated();
+  }
   return metadata;
 }
 

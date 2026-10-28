@@ -44,7 +44,10 @@ export async function onRequest(context) {
         return withFileHeaders(response, fileId);  // Directly return image response, terminate execution
     }
 
-    const metadata = await getOrCreateMetadata(env, fileId);
+    let metadataChanged = false;
+    const metadata = await getOrCreateMetadata(env, fileId, () => {
+        metadataChanged = true;
+    });
 
     // Handle based on ListType and Label
     if (isWhitelisted(metadata)) {
@@ -67,9 +70,12 @@ export async function onRequest(context) {
         return Response.redirect(`${url.origin}/block-img.html`, 302);
     }
 
-    // Only save metadata if content is not adult content
-    // Adult content cases are already handled above and will not reach this point
-    await putMetadata(env, fileId, metadata);
+    // Persist metadata only when something actually changed. Writing on every
+    // view would burn the KV free-tier write quota (1,000 writes/day) and make
+    // images unviewable once exhausted, so unchanged views skip the put.
+    if (metadataChanged || moderationResult.changed) {
+        await putMetadata(env, fileId, metadata);
+    }
 
     // Return file content
     return withFileHeaders(response, fileId);
@@ -131,7 +137,7 @@ async function moderateFile(env, url, fileId, metadata, response) {
     // A stored verdict is final — re-moderating every view would burn provider
     // quota (and for Workers AI, neuron allocation) for no new information.
     if (metadata.Label && metadata.Label !== LABEL.NONE) {
-        return { blocked: isBlocked(metadata) };
+        return { blocked: isBlocked(metadata), changed: false };
     }
 
     try {
@@ -144,12 +150,13 @@ async function moderateFile(env, url, fileId, metadata, response) {
 
         if (label) {
             metadata.Label = label;
+            return { blocked: isBlocked(metadata), changed: true };
         }
     } catch (error) {
         console.error("Error during content moderation: " + error.message);
     }
 
-    return { blocked: isBlocked(metadata) };
+    return { blocked: isBlocked(metadata), changed: false };
 }
 
 function withFileHeaders(response, filename) {
@@ -158,11 +165,20 @@ function withFileHeaders(response, filename) {
     const effectiveType = correctedType || upstreamType;
     const inline = isPreviewableContent(effectiveType) || isPreviewableFilename(filename);
 
+    // Files are immutable, so let browsers cache them. Without this, every page
+    // view re-fetches every image through the Function, consuming KV reads and
+    // (before the conditional-write fix) KV writes.
+    const headers = new Headers(response.headers);
+    headers.set('Cache-Control', 'public, max-age=86400');
+
     if (!correctedType && !inline) {
-        return response;
+        return new Response(response.body, {
+            status: response.status,
+            statusText: response.statusText,
+            headers,
+        });
     }
 
-    const headers = new Headers(response.headers);
     if (correctedType) {
         headers.set('Content-Type', correctedType);
     }
